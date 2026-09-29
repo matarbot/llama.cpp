@@ -161,6 +161,61 @@ static bool server_save_checkpoints_sidecar(const std::string & filepath, const 
     return out.good();
 }
 
+static bool server_load_checkpoints_sidecar(const std::string & filepath, std::list<common_prompt_checkpoint> & checkpoints) {
+    std::ifstream in(server_checkpoint_sidecar_path(filepath), std::ios::binary);
+    if (!in.is_open()) {
+        return false;
+    }
+
+    uint32_t magic  = 0;
+    uint32_t version = 0;
+    uint32_t n_ckpt = 0;
+
+    in.read((char *) &magic,   sizeof(magic));
+    in.read((char *) &version, sizeof(version));
+    in.read((char *) &n_ckpt,  sizeof(n_ckpt));
+
+    if (!in.good() || magic != SERVER_CKPT_MAGIC || version != SERVER_CKPT_VERSION) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < n_ckpt; ++i) {
+        common_prompt_checkpoint ckpt;
+
+        int64_t  n_tokens  = 0;
+        int32_t  id_task   = -1;
+        int32_t  pos_min   = 0;
+        int32_t  pos_max   = 0;
+        uint64_t tgt_size  = 0;
+        uint64_t dft_size  = 0;
+        uint64_t spec_size = 0;
+
+        in.read((char *) &n_tokens,  sizeof(n_tokens));
+        in.read((char *) &id_task,   sizeof(id_task));
+        in.read((char *) &pos_min,   sizeof(pos_min));
+        in.read((char *) &pos_max,   sizeof(pos_max));
+        in.read((char *) &tgt_size,  sizeof(tgt_size));
+        if (in.good() && tgt_size)  { ckpt.data_tgt.resize(tgt_size);  in.read((char *) ckpt.data_tgt.data(),  tgt_size); }
+        in.read((char *) &dft_size,  sizeof(dft_size));
+        if (in.good() && dft_size)  { ckpt.data_dft.resize(dft_size);  in.read((char *) ckpt.data_dft.data(),  dft_size); }
+        in.read((char *) &spec_size, sizeof(spec_size));
+        if (in.good() && spec_size) { ckpt.data_spec.resize(spec_size); in.read((char *) ckpt.data_spec.data(), spec_size); }
+
+        if (!in.good()) {
+            return false;
+        }
+
+        ckpt.n_tokens = n_tokens;
+        ckpt.id_task  = id_task;
+        ckpt.pos_min  = pos_min;
+        ckpt.pos_max  = pos_max;
+
+        checkpoints.push_back(std::move(ckpt));
+    }
+
+    return true;
+}
+
 struct server_batch {
     common_batch view; // the rendered sub-batch [off, off + n_tokens), see render()
 
@@ -2678,6 +2733,17 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        // rebuild the checkpoint ledger from the sidecar so the prefix
+                        // reuse guard can roll back non-rewindable memory to a checkpoint
+                        // position; without it every request after a restore re-processes
+                        // the whole prefix (#25913). a missing or invalid sidecar simply
+                        // leaves the ledger empty (degrade to the pre-fix behavior).
+                        if (server_load_checkpoints_sidecar(filepath, slot->prompt.checkpoints)) {
+                            SLT_INF(*slot, "restored %zu context checkpoint(s) from sidecar\n", slot->prompt.checkpoints.size());
+                        } else {
+                            SLT_INF(*slot, "%s", "no checkpoint sidecar found, restored slot has no checkpoints");
+                        }
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
