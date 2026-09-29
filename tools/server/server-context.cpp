@@ -108,6 +108,59 @@ enum slot_state {
 
 struct server_slot; // forward declaration
 
+// context checkpoints are the only way the server can roll back non-rewindable
+// memory (SWA windows, recurrent/hybrid state) to a prefix reuse point. they live in
+// the slot's RAM and die with the process, so a slot restored from disk never has any
+// and every subsequent request re-processes its whole prefix (see #25913).
+// persist them next to the slot save file so restore can rebuild the ledger.
+// sidecar format: magic "LCKP" version u32, n_checkpoints u32, then per checkpoint:
+//   n_tokens i64, id_task i32, pos_min i32, pos_max i32,
+//   data_tgt u64+bytes, data_dft u64+bytes, data_spec u64+bytes.
+static constexpr uint32_t SERVER_CKPT_MAGIC   = 0x504B434C; // "LCKP"
+static constexpr uint32_t SERVER_CKPT_VERSION  = 1;
+
+static std::string server_checkpoint_sidecar_path(const std::string & filepath) {
+    return filepath + ".ckpt";
+}
+
+static bool server_save_checkpoints_sidecar(const std::string & filepath, const std::list<common_prompt_checkpoint> & checkpoints) {
+    std::ofstream out(server_checkpoint_sidecar_path(filepath), std::ios::binary);
+    if (!out.is_open()) {
+        return false;
+    }
+
+    const uint32_t magic  = SERVER_CKPT_MAGIC;
+    const uint32_t version = SERVER_CKPT_VERSION;
+    const uint32_t n_ckpt = (uint32_t) checkpoints.size();
+
+    out.write((const char *) &magic,    sizeof(magic));
+    out.write((const char *) &version,  sizeof(version));
+    out.write((const char *) &n_ckpt,   sizeof(n_ckpt));
+
+    for (const auto & ckpt : checkpoints) {
+        const int64_t  n_tokens  = ckpt.n_tokens;
+        const int32_t  id_task   = ckpt.id_task;
+        const int32_t  pos_min   = ckpt.pos_min;
+        const int32_t  pos_max   = ckpt.pos_max;
+        const uint64_t tgt_size  = ckpt.data_tgt.size();
+        const uint64_t dft_size  = ckpt.data_dft.size();
+        const uint64_t spec_size = ckpt.data_spec.size();
+
+        out.write((const char *) &n_tokens,  sizeof(n_tokens));
+        out.write((const char *) &id_task,   sizeof(id_task));
+        out.write((const char *) &pos_min,   sizeof(pos_min));
+        out.write((const char *) &pos_max,   sizeof(pos_max));
+        out.write((const char *) &tgt_size,  sizeof(tgt_size));
+        if (tgt_size)  { out.write((const char *) ckpt.data_tgt.data(),  tgt_size); }
+        out.write((const char *) &dft_size,  sizeof(dft_size));
+        if (dft_size)  { out.write((const char *) ckpt.data_dft.data(),  dft_size); }
+        out.write((const char *) &spec_size, sizeof(spec_size));
+        if (spec_size) { out.write((const char *) ckpt.data_spec.data(), spec_size); }
+    }
+
+    return out.good();
+}
+
 struct server_batch {
     common_batch view; // the rendered sub-batch [off, off + n_tokens), see render()
 
@@ -2558,6 +2611,12 @@ private:
                     if (nwrite == 0) {
                         send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
                         break;
+                    }
+
+                    // persist the checkpoint ledger alongside the KV state; the main save
+                    // already succeeded, so a sidecar failure is a warning, not an error
+                    if (!server_save_checkpoints_sidecar(filepath, slot->prompt.checkpoints)) {
+                        SRV_WRN("%s: failed to write checkpoint sidecar for slot %d\n", __func__, id_slot);
                     }
 
                     const int64_t t_end = ggml_time_us();
