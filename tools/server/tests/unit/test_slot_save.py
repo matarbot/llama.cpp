@@ -159,6 +159,167 @@ def test_slot_erase():
 
 
 #
+# Checkpoint persistence for SWA models (#25913).
+#
+# On SWA/hybrid models, prefix reuse is gated on a context checkpoint that can roll back
+# non-rewindable memory; the slot save file does not carry the checkpoint ledger, so a
+# restored slot re-processes the full prompt on every request. The ledger is persisted in
+# a sidecar file (<file>.ckpt) next to the slot save file and rebuilt at restore.
+#
+
+# sidecar file written next to the slot save file:
+#   magic(4) "LCKP" version(u32) n_checkpoints(u32) desc_tgt_len(u32) desc_dft_len(u32)
+#   desc_tgt bytes + desc_dft bytes
+#   per checkpoint: n_tokens(i64) id_task(i32) pos_min(i32) pos_max(i32)
+#     data_tgt_size(u64) + bytes, data_dft_size(u64) + bytes, data_spec_size(u64) + bytes
+CKPT_MAGIC = b"LCKP"
+CKPT_RECORD_HEADER = struct.Struct("<qiII")  # n_tokens, id_task, pos_min, pos_max; then 3x u64 blob sizes
+
+# a text prefix long enough to produce a context checkpoint, and a suffix to append after the restore
+CKPT_PREFIX = (
+    "The city of Amsterdam was built on the river Amstel. Its concentric canals "
+    "were dug in the seventeenth century during the Dutch Golden Age, when the city "
+    "grew rapidly as a center of trade and science. The canal ring, planned as a "
+    "unified whole, remains one of the most remarkable urban projects of early modern "
+    "Europe. "
+) * 4
+CKPT_SUFFIX = "What is the name of the river Amsterdam was built on?"
+
+
+@pytest.fixture
+def ckpt_server():
+    # tinygemma3 is an SWA model: prefix reuse requires a checkpoint, so it exercises the persist path
+    ckpt = ServerPreset.tinygemma3()
+    ckpt.slot_save_path = "./tmp"
+    ckpt.temperature = 0.0
+    ckpt.n_ctx = 4096
+    ckpt.n_predict = 8
+    # disable the in-RAM prompt cache: prefix reuse can then only come from the disk state
+    ckpt.cache_ram = 0
+    # lower the checkpoint spacing so the prefix earns a checkpoint during processing
+    ckpt.checkpoint_min_step = 128
+    return ckpt
+
+
+def _ckpt_completion(server, prompt: str, id_slot: int):
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": id_slot,
+        "cache_prompt": True,
+        "seed": 42,
+    })
+    assert res.status_code == 200
+    return res
+
+
+def _ckpt_parse_sidecar(path: str):
+    with open(path, "rb") as f:
+        data = f.read()
+    magic, version, n_ckpt, tgt_len, dft_len = struct.unpack_from("<4sIIII", data, 0)
+    assert magic == CKPT_MAGIC
+    assert version == 1
+    assert n_ckpt >= 1
+    off = 20
+    desc_tgt = data[off:off + tgt_len]; off += tgt_len
+    desc_dft = data[off:off + dft_len]; off += dft_len
+    records = []
+    for _ in range(n_ckpt):
+        n_tokens, id_task, pos_min, pos_max = CKPT_RECORD_HEADER.unpack_from(data, off)
+        off += CKPT_RECORD_HEADER.size
+        # each blob is preceded by its size, matching the write order
+        tgt_size = struct.unpack_from("<Q", data, off)[0]; off += 8 + tgt_size
+        dft_size = struct.unpack_from("<Q", data, off)[0]; off += 8 + dft_size
+        spec_size = struct.unpack_from("<Q", data, off)[0]; off += 8 + spec_size
+        records.append((n_tokens, id_task, pos_min, pos_max))
+    # the byte layout must be fully consumed - the ledger is byte-exact
+    assert off == len(data)
+    return records
+
+
+def test_slot_save_checkpoint_sidecar_and_reuse(ckpt_server):
+    server = ckpt_server
+    server.start()
+
+    res = _ckpt_completion(server, CKPT_PREFIX, 1)
+    assert res.body["timings"]["cache_n"] == 0  # cold: everything processed
+    total_n = res.body["timings"]["prompt_n"] + res.body["timings"]["cache_n"]
+
+    res = server.make_request("POST", "/slots/1?action=save", data={"filename": "ckpt_inproc.bin"})
+    assert res.status_code == 200
+    n_saved = res.body["n_saved"]
+
+    records = _ckpt_parse_sidecar("./tmp/ckpt_inproc.bin.ckpt")
+    # multi-checkpoint fidelity: count, ordering and bounds of every record
+    n_tokens = [r[0] for r in records]
+    assert n_tokens == sorted(n_tokens)
+    assert all(0 < t <= n_saved for t in n_tokens)
+
+    res = server.make_request("POST", "/slots/0?action=restore", data={"filename": "ckpt_inproc.bin"})
+    assert res.status_code == 200
+    assert res.body["n_restored"] == n_saved
+
+    # slot 0 never saw this prefix in RAM: reuse can only come from the restored checkpoints
+    res = _ckpt_completion(server, CKPT_PREFIX + CKPT_SUFFIX, 0)
+    assert res.body["timings"]["cache_n"] > 0, "restored prefix was not reused: checkpoints were lost in the round-trip"
+    assert res.body["timings"]["prompt_n"] < total_n
+
+
+def test_slot_save_checkpoint_reuse_across_restart(ckpt_server):
+    server = ckpt_server
+    server.start()
+
+    res = _ckpt_completion(server, CKPT_PREFIX, 0)
+    assert res.body["timings"]["cache_n"] == 0
+
+    res = server.make_request("POST", "/slots/0?action=save", data={"filename": "ckpt_restart.bin"})
+    assert res.status_code == 200
+    n_saved = res.body["n_saved"]
+
+    # restart: all in-memory checkpoint state dies with the process
+    server.stop()
+    server.start()
+
+    res = server.make_request("POST", "/slots/0?action=restore", data={"filename": "ckpt_restart.bin"})
+    assert res.status_code == 200
+    assert res.body["n_restored"] == n_saved
+
+    res = _ckpt_completion(server, CKPT_PREFIX + CKPT_SUFFIX, 0)
+    assert res.body["timings"]["cache_n"] > 0, "restored prefix was not reused after restart: checkpoints were never persisted"
+
+
+def test_slot_restore_sidecar_missing_or_truncated_degrades(ckpt_server):
+    server = ckpt_server
+    server.start()
+
+    _ckpt_completion(server, CKPT_PREFIX, 0)
+    res = server.make_request("POST", "/slots/0?action=save", data={"filename": "ckpt_degrade.bin"})
+    assert res.status_code == 200
+    n_saved = res.body["n_saved"]
+    sidecar = "./tmp/ckpt_degrade.bin.ckpt"
+
+    # truncated copies (cut mid-header, mid-descriptor, mid-record) must be rejected
+    # without failing the restore; the slot degrades to full re-processing
+    with open(sidecar, "rb") as f:
+        raw = f.read()
+    for cut in (10, 24, len(raw) - 1):
+        truncated = raw[:cut]
+        with open(sidecar, "wb") as f:
+            f.write(truncated)
+        res = server.make_request("POST", "/slots/1?action=restore", data={"filename": "ckpt_degrade.bin"})
+        assert res.status_code == 200
+        assert res.body["n_restored"] == n_saved
+
+    os.remove(sidecar)
+    res = server.make_request("POST", "/slots/1?action=restore", data={"filename": "ckpt_degrade.bin"})
+    assert res.status_code == 200
+    assert res.body["n_restored"] == n_saved
+
+    # the slot stays usable and deterministic after the degraded restores
+    content = _ckpt_completion(server, CKPT_PREFIX + CKPT_SUFFIX, 1).body["content"]
+    assert _ckpt_completion(server, CKPT_PREFIX + CKPT_SUFFIX, 1).body["content"] == content
+
+
+#
 # Multimodal server (mmproj loaded) slot save/restore.
 #
 # A pure-text slot on a multimodal server and a slot containing images must both support save/restore.
